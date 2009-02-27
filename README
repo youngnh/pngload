@@ -1,0 +1,20 @@
+
+This is the beginnings of a pure Haskell loader for PNG images. It
+stores the uncompressed image in a StorableArray (Int,Int) Word8, so
+it should be convenient to use as a texture loader in OpenGL
+applications since you can get a Ptr Word8 to the image data easily.
+
+The performance is reasonable (the following run loads an 1.5megabyte
+1024x768 24bit PNG image and writes out the raw bytes on a 2GHz
+MacBook):
+
+Mars2:PNG marko$ time ./Test scenery_1
+
+real	0m0.315s
+user	0m0.267s
+sys	0m0.027s
+
+Source for the test is in Test.hs.
+
+Note that the library has not been tested with every possible kind of
+PNG images, so use at your own risk.
