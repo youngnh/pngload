@@ -4,7 +4,7 @@
 -- Module      :  Graphics.Formats.PNG
 -- Copyright   :  (c) Marko Lauronen 2008
 -- License     :  BSD
--- 
+--
 -- Maintainer  :  marko.lauronen@pp1.inet.fi
 -- Stability   :  experimental
 -- Portability :  non-portable (GHC only)
@@ -23,6 +23,7 @@ module Codec.Image.PNG
       PNGImage, Width, Height
      -- * Functions
     , loadPNGFile
+    , writePNGFile
     , dimensions
     --, pixelWidth
     , imageData
@@ -36,6 +37,7 @@ import Text.Parsec.Prim
 
 import Data.Array.Unboxed
 import Data.Array.Storable
+import Data.Bits
 import Data.Word
 import Data.List
 import qualified Data.ByteString.Lazy as LB
@@ -143,12 +145,12 @@ parseIhdr = do
   --[(0,Ct0), (2,Ct2), (3,Ct3), (4,Ct4), (6,Ct6)]
   colorType <- allowedValues word8 [(2,Ct2), (6,Ct6)]
                <?> "valid colorType: supported Ct2,Ct6"
-  compressionMethod <- allowedValues word8 [(0, Deflate)] 
+  compressionMethod <- allowedValues word8 [(0, Deflate)]
                        <?> "valid compression method: supported Deflate"
-  filterMethod <- allowedValues word8 [(0, Adaptive)] 
+  filterMethod <- allowedValues word8 [(0, Adaptive)]
                   <?> "valid filter method: supported Adaptive"
-  -- [(0, NoInterlace), (1, Adam7)] 
-  interlaceMethod <- allowedValues word8 [(0, NoInterlace)] 
+  -- [(0, NoInterlace), (1, Adam7)]
+  interlaceMethod <- allowedValues word8 [(0, NoInterlace)]
                      <?> "valid interlace method: supported NoInterlace"
   return $ IHDR {
                ihdr_width = width
@@ -242,3 +244,91 @@ pixelWidth img = bytesPerPixel (ihdr_colorType hdr) (ihdr_bitDepth hdr)
 -- |Get image data as C-compatible StorableArray
 imageData :: PNGImage -> StorableArray (Int,Int) Word8
 imageData img = pngImg_imageData img
+
+class Writable a where
+    toBS :: a -> LB.ByteString
+
+instance Writable Word32 where
+    toBS = writeWord32
+
+instance Writable ColorType where
+    toBS Ct0 = LB.pack [0]
+    toBS Ct2 = LB.pack [2]
+    toBS Ct4 = LB.pack [4]
+    toBS Ct6 = LB.pack [6]
+
+instance Writable BitDepth where
+    toBS Bd1  = LB.pack [1]
+    toBS Bd2  = LB.pack [2]
+    toBS Bd4  = LB.pack [4]
+    toBS Bd8  = LB.pack [8]
+    toBS Bd16 = LB.pack[16]
+
+instance Writable CompressionMethod where
+    toBS _ = LB.pack [0]
+
+instance Writable FilterMethod where
+    toBS _ = LB.pack [0]
+
+instance Writable InterlaceMethod where
+    toBS NoInterlace = LB.pack [0]
+    toBS Adam7       = LB.pack [1]
+
+instance Writable PNGChunk where
+    toBS (IHDR w h bd ct cm fm im) = LB.concat [len, typeField, dataField, crcField]
+        where len       = writeWord32 13
+              typeField = LB.pack $ map (fromIntegral . fromEnum) "IHDR"
+              dataField = LB.concat $ [toBS w,toBS h,toBS bd,toBS ct,toBS cm,toBS fm,toBS im]
+              crcField  = toBS . crc . LB.concat $ [typeField,dataField]
+    toBS (IDAT dataField) = LB.concat [len, typeField, dataField, crcField]
+        where len       = writeWord32 . fromIntegral . LB.length $ dataField
+              typeField = LB.pack $ map (fromIntegral .fromEnum) "IDAT"
+              crcField  = toBS . crc . LB.concat $ [typeField, dataField]
+    toBS IEND       = LB.concat [len, typeField, crcField]
+        where len       = writeWord32 0
+              typeField = LB.pack $ map (fromIntegral . fromEnum) "IEND"
+              crcField  = toBS . crc $ typeField
+
+writeWord32 :: Word32 -> LB.ByteString
+writeWord32 w = LB.append (writeWord16 hi) (writeWord16 lo)
+    where hi = fromIntegral (w `shiftR` 16)
+          lo = fromIntegral w
+
+writeWord16 :: Word16 -> LB.ByteString
+writeWord16 w = LB.pack [hi, lo]
+    where hi = fromIntegral (w `shiftR` 8)
+          lo = fromIntegral w
+
+filterScanline :: [Word8] -> LB.ByteString
+filterScanline ws = LB.pack (0:ws)
+
+writePNGChunks :: FilePath -> [PNGChunk] -> IO ()
+writePNGChunks path cs = do chunks <- return (LB.concat $ map toBS cs)
+                            full <- return $ LB.append pngHeaderBytes chunks
+                            LB.writeFile path full
+
+writePNGFile :: FilePath -> StorableArray (Int,Int) Word8 -> IO ()
+writePNGFile path imgdata = do dat <- encodePNGData imgdata
+                               (_,(height',width')) <- getBounds imgdata
+                               (height,width) <- return ((fromIntegral height') + 1, (fromIntegral width') + 1)
+                               ihdr <- return $ IHDR (div width 4) height Bd8 Ct6 Deflate Adaptive NoInterlace
+                               writePNGChunks path [ihdr, IDAT dat, IEND]
+
+iomap :: (a -> IO b) -> [a] -> IO [b]
+iomap iofn xs = iomap' iofn [] xs
+    where iomap' _    lst []     = return lst
+          iomap' iofn lst (x:xs) = do elt <- iofn x
+                                      iomap' iofn (lst ++ [elt]) xs
+
+scanline :: StorableArray (Int,Int) Word8 -> Int -> IO [Word8]
+scanline arr y = do ((_,x),(_,x')) <- getBounds arr
+                    indices <- return $ map ((,) y) [x..x']
+                    iomap (readArray arr) indices
+
+scanlines :: StorableArray (Int,Int) Word8 -> IO [[Word8]]
+scanlines arr = do ((y,_),(y',_)) <- getBounds arr
+                   iomap (scanline arr) [y..y']
+
+encodePNGData :: StorableArray (Int,Int) Word8 -> IO LB.ByteString
+encodePNGData arr = do lines <- scanlines arr
+                       return $ (compress . LB.concat) (map filterScanline lines)
